@@ -24,7 +24,16 @@ A lightweight PDF reader for Linux written in a single Python file (GTK 3 + Popp
 | Links | Click to follow (hover shows the target). Web/mail links open in your browser/mail app; links inside the document jump there; Alt+Left goes back |
 | Zoom | Ctrl +/−, Ctrl+mouse wheel, Ctrl+0 fit width, Ctrl+1 100% |
 | Navigate | Type a page number in the header bar; PgUp/PgDn, Space, arrows, Home/End |
+| Outline | F9 or the sidebar button shows the document's table of contents; click an entry to jump there |
+| Rotate | Ctrl+Left / Ctrl+Right (view only; printing is unaffected) |
+| Fullscreen | F11; Esc leaves |
+| Presentation | F5: one page per screen on black. Next: Space, Enter, →, ↓, PgDn, click, wheel. Previous: Shift+Space, Backspace, ←, ↑, PgUp, right-click. Home/End, Esc or F5 to leave |
+| Menu | The ☰ button (or right-click on the page) lists outline, rotation, fullscreen, presentation and print |
 | Close | Ctrl+W / Ctrl+Q |
 
 Password-protected PDFs prompt for the password. For safety, only http(s), mailto and ftp links are opened;
 links that would launch programs or run scripts are ignored.
+
+Each document reopens where you left it (page, zoom, rotation and whether the outline
+was shown). This is stored in `~/.local/state/mypdf/positions.json` (the last 1000 files);
+delete that file to forget the history.

@@ -4,6 +4,8 @@
 Usage: mypdf [file.pdf]
 """
 import bisect
+import json
+import math
 import os
 import signal
 import sys
@@ -15,13 +17,14 @@ import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
+gi.require_version("Pango", "1.0")
 try:
     gi.require_version("Poppler", "0.18")
 except ValueError:
     sys.exit("Poppler bindings are missing. Install them with:\n"
              "  sudo apt install gir1.2-poppler-0.18")
 import cairo
-from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Poppler
+from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango, Poppler
 
 MARGIN = 16                  # px around and between pages
 ZOOM_MIN, ZOOM_MAX = 0.2, 6.0
@@ -34,6 +37,9 @@ SEL_BG = (0x3584, 0x8484, 0xE4E4)
 MATCH_COLOR = (1.0, 0.85, 0.0, 0.40)
 CURRENT_MATCH_COLOR = (1.0, 0.45, 0.0, 0.55)
 SAFE_URI_SCHEMES = {"http", "https", "mailto", "ftp"}
+STATE_FILE = os.path.join(GLib.get_user_state_dir(), "mypdf", "positions.json")
+STATE_MAX_ENTRIES = 1000
+SIDEBAR_WIDTH = 260
 
 CTRL = Gdk.ModifierType.CONTROL_MASK
 SHIFT = Gdk.ModifierType.SHIFT_MASK
@@ -44,6 +50,30 @@ def poppler_color(rgb):
     c = Poppler.Color()
     c.red, c.green, c.blue = rgb
     return c
+
+
+def read_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_state(data):
+    """Write the position store atomically, keeping only the most recent entries."""
+    if len(data) > STATE_MAX_ENTRIES:
+        newest = sorted(data.items(), key=lambda kv: kv[1].get("time", 0), reverse=True)
+        data = dict(newest[:STATE_MAX_ENTRIES])
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, STATE_FILE)
+    except OSError as e:
+        print(f"mypdf: cannot save positions: {e}", file=sys.stderr)
 
 
 class Reader(Gtk.Window):
@@ -60,9 +90,18 @@ class Reader(Gtk.Window):
         self.ys = []             # top y of each page, for bisect
         self.zoom = 1.0
         self.fit_mode = "auto"     # "auto", "width" or None (fixed zoom)
+        self.rotation = 0          # view rotation, degrees clockwise: 0, 90, 180, 270
         self.current = 0
         self.cache = OrderedDict()   # page index -> (key, surface)
         self.print_settings = None
+        self.is_fullscreen = False
+
+        # Presentation mode
+        self.presenting = False
+        self.pres_page = 0
+        self.pres_cache = OrderedDict()
+        self.pres_was_fullscreen = False
+        self.pres_cursor_id = 0
 
         # Selection: anchor/end are (page, x, y) in PDF points.
         self.sel_anchor = None
@@ -87,6 +126,7 @@ class Reader(Gtk.Window):
         self.hover_link = None
         self.pressed_link = None
         self.history = []        # previous scroll positions, for Alt+Left
+        self.has_outline = False
 
         self._build_ui()
         if path:
@@ -104,6 +144,10 @@ class Reader(Gtk.Window):
         self.headerbar = hb
         self.set_titlebar(hb)
 
+        self.sidebar_toggle = Gtk.ToggleButton(image=Gtk.Image.new_from_icon_name(
+            "sidebar-show-symbolic", Gtk.IconSize.BUTTON), tooltip_text="Outline (F9)")
+        self.sidebar_toggle.connect("toggled", lambda b: self.sidebar.set_visible(b.get_active()))
+        hb.pack_start(self.sidebar_toggle)
         hb.pack_start(self._button("document-open-symbolic", "Open (Ctrl+O)", self.open_dialog))
         self.print_button = self._button("document-print-symbolic", "Print (Ctrl+P)", self.print_doc)
         hb.pack_start(self.print_button)
@@ -126,6 +170,11 @@ class Reader(Gtk.Window):
         self.zoom_button.connect("clicked", lambda *_: self.set_zoom(fit="width"))
         zoom.pack_start(self.zoom_button, False, False, 0)
         zoom.pack_start(self._button("zoom-in-symbolic", "Zoom in (Ctrl++)", self.zoom_in), False, False, 0)
+        self.menu_button = Gtk.Button.new_from_icon_name("open-menu-symbolic", Gtk.IconSize.BUTTON)
+        self.menu_button.set_tooltip_text("Menu")
+        self.menu_button.connect("clicked", lambda b: self.build_menu(False).popup_at_widget(
+            b, Gdk.Gravity.SOUTH_EAST, Gdk.Gravity.NORTH_EAST, None))
+        hb.pack_end(self.menu_button)
         hb.pack_end(zoom)
 
         self.search_toggle = Gtk.ToggleButton(image=Gtk.Image.new_from_icon_name(
@@ -176,13 +225,49 @@ class Reader(Gtk.Window):
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         vbox.pack_start(self.search_bar, False, False, 0)
         vbox.pack_start(sw, True, True, 0)
-        self.add(vbox)
         self.hadj = sw.get_hadjustment()
         self.vadj = sw.get_vadjustment()
         self.vadj.connect("value-changed", lambda *_: self.update_current_page())
         self._last_width = 0
 
+        # Outline sidebar: title, page number, Poppler.Action
+        self.outline = Gtk.TreeView(headers_visible=False, enable_tree_lines=False)
+        self.outline.set_activate_on_single_click(True)
+        self.outline.connect("row-activated", self.on_outline_activated)
+        title_cell = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+        title_col = Gtk.TreeViewColumn("Title", title_cell, text=0)
+        title_col.set_expand(True)
+        page_cell = Gtk.CellRendererText(xalign=1.0)
+        page_cell.set_property("foreground-rgba", Gdk.RGBA(0.5, 0.5, 0.5, 1))
+        self.outline.append_column(title_col)
+        self.outline.append_column(Gtk.TreeViewColumn("Page", page_cell, text=1))
+        self.outline.set_tooltip_column(0)
+        self.sidebar = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        self.sidebar.add(self.outline)
+        self.sidebar.set_no_show_all(True)
+        self.outline.show()
+
+        paned = Gtk.Paned(position=SIDEBAR_WIDTH)
+        paned.pack1(self.sidebar, False, False)
+        paned.pack2(vbox, True, False)
+
+        # Presentation view: one page at a time, fitted to the screen
+        self.pres = Gtk.DrawingArea(can_focus=True)
+        self.pres.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.POINTER_MOTION_MASK
+                             | Gdk.EventMask.SCROLL_MASK)
+        self.pres.connect("draw", self.on_pres_draw)
+        self.pres.connect("button-press-event", self.on_pres_press)
+        self.pres.connect("scroll-event", self.on_pres_scroll)
+        self.pres.connect("motion-notify-event", lambda *_: self.pres_show_cursor())
+
+        self.stack = Gtk.Stack()
+        self.stack.add_named(paned, "document")
+        self.stack.add_named(self.pres, "presentation")
+        self.add(self.stack)
+
         self.connect("key-press-event", self.on_key)
+        self.connect("window-state-event", self.on_window_state)
+        self.connect("delete-event", lambda *_: self.save_position() or False)
         self.drag_dest_set(Gtk.DestDefaults.ALL, [], Gdk.DragAction.COPY)
         self.drag_dest_add_uri_targets()
         self.connect("drag-data-received", self.on_drop)
@@ -191,6 +276,7 @@ class Reader(Gtk.Window):
     def update_sensitivity(self):
         for w in (self.print_button, self.page_entry, self.search_toggle):
             w.set_sensitive(self.doc is not None)
+        self.sidebar_toggle.set_sensitive(self.has_outline)
 
     def error(self, text):
         d = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.ERROR,
@@ -230,11 +316,16 @@ class Reader(Gtk.Window):
                     self.error(f"Cannot open “{name}”:\n{e.message}")
                     return False
 
+        if self.presenting:
+            self.leave_presentation()
+        self.save_position()
         self.doc = doc
         self.path = gfile.get_path()
         self.pages = [doc.get_page(i) for i in range(doc.get_n_pages())]
         self.sizes = [p.get_size() for p in self.pages]
+        self.rotation = 0
         self.cache.clear()
+        self.pres_cache.clear()
         self.link_cache.clear()
         self.history.clear()
         self.hover_link = self.pressed_link = None
@@ -244,14 +335,62 @@ class Reader(Gtk.Window):
         self.headerbar.set_title(doc.get_title() or name)
         self.headerbar.set_subtitle(name if doc.get_title() else None)
         self.page_label.set_text(f"/ {len(self.pages)}")
+        self.build_outline()
         self.update_page_entry()
         self.update_sensitivity()
-        self.relayout()
-        self.vadj.set_value(0)
         self.hadj.set_value(0)
+        self.restore_position()
         self.canvas.grab_focus()
         self.start_search()  # re-run (or clear) the search for the new document
         return False
+
+    # ---------------------------------------------------- remembered state
+    def position(self, anchor=0.0):
+        """(page, offset) of the point `anchor` (0 = top, 0.5 = middle) down the view;
+        offset is a fraction of that page's height."""
+        if self.presenting:
+            return self.pres_page, 0.0
+        y = self.vadj.get_value() + self.vadj.get_page_size() * anchor
+        i = self.page_at(y + (MARGIN if anchor == 0 else 0))
+        _, py, _, ph = self.rects[i]
+        return i, (y - py) / ph
+
+    def set_position(self, page, offset=0.0, anchor=0.0):
+        page = min(max(page, 0), len(self.pages) - 1)
+        _, py, _, ph = self.rects[page]
+        self.vadj.set_value(py + offset * ph - self.vadj.get_page_size() * anchor)
+        self.current = page
+        self.update_current_page()
+        self.update_page_entry()
+
+    def save_position(self):
+        if not self.path or not self.rects:
+            return
+        page, offset = self.position()
+        data = read_state()
+        data[self.path] = {"page": page, "offset": round(offset, 4), "zoom": round(self.zoom, 4),
+                           "fit": self.fit_mode, "rotation": self.rotation,
+                           "sidebar": self.sidebar.get_visible(), "time": int(time.time())}
+        write_state(data)
+
+    def restore_position(self):
+        st = read_state().get(self.path) or {}
+        rotation = st.get("rotation", 0)
+        self.rotation = rotation if rotation in (0, 90, 180, 270) else 0
+        fit = st.get("fit", "auto")
+        self.fit_mode = fit if fit in ("auto", "width", None) else "auto"
+        if self.fit_mode is None:
+            try:
+                self.zoom = min(max(float(st.get("zoom", 1.0)), ZOOM_MIN), ZOOM_MAX)
+            except (TypeError, ValueError):
+                self.zoom = 1.0
+        self.sidebar_toggle.set_active(bool(st.get("sidebar")) and self.has_outline)
+        self.relayout()
+        try:
+            self.set_position(int(st.get("page", 0)), float(st.get("offset", 0.0)))
+        except (TypeError, ValueError):
+            self.set_position(0)
+        self.history.clear()
 
     def open_dialog(self):
         d = Gtk.FileChooserNative(title="Open PDF", transient_for=self,
@@ -279,7 +418,8 @@ class Reader(Gtk.Window):
             self.canvas.set_size(1, 1)
             return
         avail = self.canvas.get_allocated_width()
-        max_w = max(w for w, _ in self.sizes)
+        view_sizes = [self.view_size(i) for i in range(len(self.pages))]
+        max_w = max(w for w, _ in view_sizes)
         if self.fit_mode and avail > 2 * MARGIN:
             z = (avail - 2 * MARGIN) / max_w
             if self.fit_mode == "auto":
@@ -289,7 +429,7 @@ class Reader(Gtk.Window):
         canvas_w = max(avail, round(max_w * z) + 2 * MARGIN)
         y = MARGIN
         self.rects = []
-        for w, h in self.sizes:
+        for w, h in view_sizes:
             pw, ph = round(w * z), round(h * z)
             self.rects.append(((canvas_w - pw) // 2, y, pw, ph))
             y += ph + MARGIN
@@ -298,25 +438,81 @@ class Reader(Gtk.Window):
         self.zoom_button.set_label(f"{round(z * 100)}%")
         self.canvas.queue_draw()
 
+    # ------------------------------------------------------------ rotation
+    # Selection, search matches and links are kept in unrotated page coordinates
+    # (PDF points, origin top-left); these helpers map them to and from the view.
+    def view_size(self, i):
+        w, h = self.sizes[i]
+        return (h, w) if self.rotation in (90, 270) else (w, h)
+
+    def apply_rotation(self, cr, i):
+        """Transform cr so page coordinates draw rotated inside the page's view box."""
+        if not self.rotation:
+            return
+        w, h = self.sizes[i]
+        cr.translate(*{90: (h, 0), 180: (w, h), 270: (0, w)}[self.rotation])
+        cr.rotate(math.radians(self.rotation))
+
+    def to_view(self, i, x, y):
+        """Page point -> canvas px."""
+        w, h = self.sizes[i]
+        r = self.rotation
+        if r == 90:
+            x, y = h - y, x
+        elif r == 180:
+            x, y = w - x, h - y
+        elif r == 270:
+            x, y = y, w - x
+        px, py, _, _ = self.rects[i]
+        return px + x * self.zoom, py + y * self.zoom
+
+    def from_view(self, i, cx, cy):
+        """Canvas px -> page point (not clamped to the page)."""
+        px, py, _, _ = self.rects[i]
+        vx, vy = (cx - px) / self.zoom, (cy - py) / self.zoom
+        w, h = self.sizes[i]
+        r = self.rotation
+        if r == 90:
+            return vy, h - vx
+        if r == 180:
+            return w - vx, h - vy
+        if r == 270:
+            return w - vy, vx
+        return vx, vy
+
+    def rotate(self, degrees):
+        if not self.pages:
+            return
+        page, _ = self.position()
+        self.rotation = (self.rotation + degrees) % 360
+        self.cache.clear()
+        self.pres_cache.clear()
+        if self.presenting:
+            self.pres.queue_draw()
+            return
+        self.relayout()
+        self.set_position(page)  # the top of the current page
+
     def on_size_allocate(self, widget, alloc):
         if alloc.width != self._last_width:
             self._last_width = alloc.width
             GLib.idle_add(self._relayout_keep_position)
 
     def _relayout_keep_position(self):
-        self.set_zoom(self.zoom, fit=self.fit_mode)
+        self.set_zoom(self.zoom, fit=self.fit_mode, anchor=0.0)
         return False
 
-    def set_zoom(self, zoom=None, fit=None):
+    def set_zoom(self, zoom=None, fit=None, anchor=0.5):
+        """Change zoom (or fit mode), keeping the point `anchor` down the view in place."""
         if not self.pages:
             return
-        vfrac = (self.vadj.get_value() + self.vadj.get_page_size() / 2) / max(1, self.vadj.get_upper())
+        page, offset = self.position(anchor)
         hfrac = (self.hadj.get_value() + self.hadj.get_page_size() / 2) / max(1, self.hadj.get_upper())
         self.fit_mode = fit
         if zoom is not None:
             self.zoom = min(max(zoom, ZOOM_MIN), ZOOM_MAX)
         self.relayout()
-        self.vadj.set_value(vfrac * self.vadj.get_upper() - self.vadj.get_page_size() / 2)
+        self.set_position(page, offset, anchor)
         self.hadj.set_value(hfrac * self.hadj.get_upper() - self.hadj.get_page_size() / 2)
 
     def zoom_in(self):
@@ -343,8 +539,14 @@ class Reader(Gtk.Window):
     def go_to_page(self, i, y=0.0):
         """Scroll so that point y (PDF points from the page top) of page i is at the top."""
         i = min(max(i, 0), len(self.pages) - 1)
+        if self.presenting:
+            self.pres_go(i)
+            return
         self.push_history()
-        self.vadj.set_value(self.rects[i][1] + y * self.zoom - MARGIN // 2)
+        top = self.rects[i][1]
+        if y and self.rotation == 0:
+            top = self.to_view(i, 0, y)[1]
+        self.vadj.set_value(top - MARGIN // 2)
 
     def push_history(self):
         self.history.append(self.vadj.get_value())
@@ -364,7 +566,7 @@ class Reader(Gtk.Window):
 
     # ----------------------------------------------------------- rendering
     def render_page(self, i, scale):
-        key = (self.zoom, scale)
+        key = (self.zoom, scale, self.rotation)
         hit = self.cache.get(i)
         if hit and hit[0] == key:
             self.cache.move_to_end(i)
@@ -376,6 +578,7 @@ class Reader(Gtk.Window):
         cr.set_source_rgb(1, 1, 1)
         cr.paint()
         cr.scale(self.zoom, self.zoom)
+        self.apply_rotation(cr, i)
         self.pages[i].render(cr)
         self.cache[i] = (key, surf)
         total = sum(s.get_width() * s.get_height() for _, s in self.cache.values())
@@ -407,28 +610,30 @@ class Reader(Gtk.Window):
                 cr.set_source_surface(self.render_page(i, scale), px, py)
                 cr.rectangle(px, py, pw, ph)
                 cr.fill()
+                # Overlays are drawn in page coordinates.
+                cr.save()
+                cr.translate(px, py)
+                cr.scale(self.zoom, self.zoom)
+                self.apply_rotation(cr, i)
                 sel = self.page_selection(i)
                 if sel:
-                    cr.save()
-                    cr.translate(px, py)
-                    cr.scale(self.zoom, self.zoom)
                     self.pages[i].render_selection(cr, sel, Poppler.Rectangle(), self.sel_style,
                                                    self.glyph_color, self.bg_color)
-                    cr.restore()
                 self.draw_matches(cr, i)
+                cr.restore()
         cr.restore()
         return False
 
     def draw_matches(self, cr, i):
+        """Highlight search matches; cr is in page coordinates."""
         rects = self.match_pages.get(i)
         if not rects:
             return
-        px, py, _, _ = self.rects[i]
-        z = self.zoom
+        pad = 1 / self.zoom
         current = self.matches[self.match_index] if self.match_index >= 0 else None
         for r in rects:
             cr.set_source_rgba(*(CURRENT_MATCH_COLOR if current == (i, r) else MATCH_COLOR))
-            cr.rectangle(px + r[0] * z - 1, py + r[1] * z - 1, (r[2] - r[0]) * z + 2, (r[3] - r[1]) * z + 2)
+            cr.rectangle(r[0] - pad, r[1] - pad, r[2] - r[0] + 2 * pad, r[3] - r[1] + 2 * pad)
             cr.fill()
 
     # -------------------------------------------------------------- search
@@ -525,13 +730,16 @@ class Reader(Gtk.Window):
     def show_match(self):
         """Scroll the current match into view and redraw."""
         i, (x1, y1, x2, y2) = self.matches[self.match_index]
-        px, py, _, _ = self.rects[i]
-        z = self.zoom
-        top, bottom = py + y1 * z, py + y2 * z
+        if self.presenting:
+            self.pres_go(i)
+            return
+        ax, ay = self.to_view(i, x1, y1)
+        bx, by = self.to_view(i, x2, y2)
+        left, right = sorted((ax, bx))
+        top, bottom = sorted((ay, by))
         v = self.vadj
         if top < v.get_value() or bottom > v.get_value() + v.get_page_size():
             v.set_value(top - v.get_page_size() / 3)
-        left, right = px + x1 * z, px + x2 * z
         hz = self.hadj
         if left < hz.get_value() or right > hz.get_value() + hz.get_page_size():
             hz.set_value(left - hz.get_page_size() / 3)
@@ -552,7 +760,7 @@ class Reader(Gtk.Window):
         px, py, pw, ph = self.rects[i]
         if not (px <= x <= px + pw and py <= y <= py + ph):
             return None
-        lx, ly = (x - px) / self.zoom, (y - py) / self.zoom
+        lx, ly = self.from_view(i, x, y)
         for x1, y1, x2, y2, mapping in self.page_links(i):
             if x1 <= lx <= x2 and y1 <= ly <= y2:
                 return mapping.action
@@ -629,12 +837,194 @@ class Reader(Gtk.Window):
         except GLib.Error as e:
             self.error(f"Cannot open link:\n{e.message}")
 
+    # ------------------------------------------------------------- outline
+    def build_outline(self):
+        store = Gtk.TreeStore(str, str, GObject.TYPE_PYOBJECT)
+        expand = []
+        try:
+            it = Poppler.IndexIter.new(self.doc)
+        except TypeError:  # PyGObject raises when the document has no outline
+            it = None
+        if it:
+            self._add_outline(store, None, it, expand)
+        self.has_outline = it is not None
+        self.outline.set_model(store)
+        for path in expand:  # parents come before their children
+            self.outline.expand_row(path, False)
+
+    def _add_outline(self, store, parent, it, expand):
+        while True:
+            action = it.get_action()
+            page = ""
+            if action.type == Poppler.ActionType.GOTO_DEST:
+                dest = self.resolve_dest(action.goto_dest.dest)
+                page = str(dest.page_num) if dest and dest.page_num > 0 else ""
+            row = store.append(parent, [(action.any.title or "").strip(), page, action])
+            child = it.get_child()
+            if child:
+                if it.is_open():
+                    expand.append(store.get_path(row))
+                self._add_outline(store, row, child, expand)
+            if not it.next():
+                break
+
+    def on_outline_activated(self, view, path, column):
+        action = view.get_model()[path][2]
+        if action:
+            self.activate_link(action)
+
+    def toggle_sidebar(self):
+        if self.has_outline and not self.presenting:
+            self.sidebar_toggle.set_active(not self.sidebar_toggle.get_active())
+
+    # ---------------------------------------------- fullscreen/presentation
+    def on_window_state(self, widget, ev):
+        self.is_fullscreen = bool(ev.new_window_state & Gdk.WindowState.FULLSCREEN)
+        return False
+
+    def toggle_fullscreen(self):
+        if self.presenting:
+            return
+        if self.is_fullscreen:
+            self.unfullscreen()
+        else:
+            self.fullscreen()
+
+    def enter_presentation(self):
+        if not self.pages or self.presenting:
+            return
+        self.presenting = True
+        self.pres_page = self.current
+        self.pres_was_fullscreen = self.is_fullscreen
+        self.headerbar.hide()
+        self.stack.set_visible_child_name("presentation")
+        self.fullscreen()
+        self.pres.grab_focus()
+        self.pres_show_cursor()
+
+    def leave_presentation(self):
+        if not self.presenting:
+            return
+        self.presenting = False
+        page = self.pres_page
+        if self.pres_cursor_id:
+            GLib.source_remove(self.pres_cursor_id)
+            self.pres_cursor_id = 0
+        if self.pres.get_window():
+            self.pres.get_window().set_cursor(None)
+        self.pres_cache.clear()
+        self.headerbar.show()
+        self.stack.set_visible_child_name("document")
+        if not self.pres_was_fullscreen:
+            self.unfullscreen()
+        self.set_position(page)
+        self.canvas.grab_focus()
+
+    def pres_go(self, i):
+        i = min(max(i, 0), len(self.pages) - 1)
+        if i != self.pres_page:
+            self.pres_page = i
+            self.current = i
+            self.update_page_entry()
+            self.pres.queue_draw()
+
+    def pres_surface(self, i, width, height, scale):
+        """Page i rendered to fit width x height, cached for the current and next pages."""
+        key = (i, width, height, scale, self.rotation)
+        if key in self.pres_cache:
+            self.pres_cache.move_to_end(key)
+            return self.pres_cache[key]
+        vw, vh = self.view_size(i)
+        s = min(width / vw, height / vh)
+        dw, dh = max(1, round(vw * s)), max(1, round(vh * s))
+        surf = cairo.ImageSurface(cairo.FORMAT_RGB24, dw * scale, dh * scale)
+        surf.set_device_scale(scale, scale)
+        cr = cairo.Context(surf)
+        cr.set_source_rgb(1, 1, 1)
+        cr.paint()
+        cr.scale(s, s)
+        self.apply_rotation(cr, i)
+        self.pages[i].render(cr)
+        self.pres_cache[key] = surf
+        while len(self.pres_cache) > 3:
+            self.pres_cache.popitem(last=False)
+        return surf
+
+    def on_pres_draw(self, widget, cr):
+        cr.set_source_rgb(0, 0, 0)
+        cr.paint()
+        if not self.pages:
+            return False
+        w, h = widget.get_allocated_width(), widget.get_allocated_height()
+        scale = widget.get_scale_factor()
+        i = self.pres_page
+        surf = self.pres_surface(i, w, h, scale)
+        sw, sh = surf.get_width() // scale, surf.get_height() // scale
+        cr.set_source_surface(surf, (w - sw) // 2, (h - sh) // 2)
+        cr.paint()
+        if i + 1 < len(self.pages):  # pre-render the next slide while idle
+            GLib.idle_add(lambda: self.presenting and self.pres_surface(i + 1, w, h, scale) and False)
+        return False
+
+    def on_pres_press(self, widget, ev):
+        if ev.type == Gdk.EventType.BUTTON_PRESS:
+            self.pres_go(self.pres_page + (1 if ev.button == 1 else -1 if ev.button == 3 else 0))
+        return True
+
+    def on_pres_scroll(self, widget, ev):
+        if ev.direction == Gdk.ScrollDirection.SMOOTH:
+            _, _, dy = ev.get_scroll_deltas()
+            step = 1 if dy > 0.5 else -1 if dy < -0.5 else 0
+        else:
+            step = {Gdk.ScrollDirection.DOWN: 1, Gdk.ScrollDirection.RIGHT: 1,
+                    Gdk.ScrollDirection.UP: -1, Gdk.ScrollDirection.LEFT: -1}.get(ev.direction, 0)
+        if step:
+            self.pres_go(self.pres_page + step)
+        return True
+
+    def pres_show_cursor(self):
+        """Show the pointer on movement and hide it again after 2 s of stillness."""
+        window = self.pres.get_window()
+        if not window:
+            return
+        window.set_cursor(None)
+        if self.pres_cursor_id:
+            GLib.source_remove(self.pres_cursor_id)
+
+        def hide():
+            self.pres_cursor_id = 0
+            if self.presenting:
+                window.set_cursor(Gdk.Cursor.new_from_name(window.get_display(), "none"))
+            return False
+        self.pres_cursor_id = GLib.timeout_add(2000, hide)
+
+    def on_pres_key(self, key, ev):
+        nxt = (Gdk.KEY_Right, Gdk.KEY_Down, Gdk.KEY_Page_Down, Gdk.KEY_space, Gdk.KEY_Return,
+               Gdk.KEY_KP_Enter, Gdk.KEY_n)
+        prev = (Gdk.KEY_Left, Gdk.KEY_Up, Gdk.KEY_Page_Up, Gdk.KEY_BackSpace, Gdk.KEY_p)
+        if ev.state & CTRL and key in (Gdk.KEY_Left, Gdk.KEY_Right):
+            self.rotate(-90 if key == Gdk.KEY_Left else 90)
+        elif key in (Gdk.KEY_Escape, Gdk.KEY_F5, Gdk.KEY_q):
+            self.leave_presentation()
+        elif key == Gdk.KEY_space and ev.state & SHIFT or key in prev:
+            self.pres_go(self.pres_page - 1)
+        elif key in nxt:
+            self.pres_go(self.pres_page + 1)
+        elif key == Gdk.KEY_Home:
+            self.pres_go(0)
+        elif key == Gdk.KEY_End:
+            self.pres_go(len(self.pages) - 1)
+        else:
+            return False
+        return True
+
     # ----------------------------------------------------------- selection
     def hit(self, x, y):
         """Canvas px -> (page, x, y) in PDF points, clamped to the nearest page."""
         i = self.page_at(y)
-        px, py, pw, ph = self.rects[i]
-        return (i, min(max(x - px, 0), pw) / self.zoom, min(max(y - py, 0), ph) / self.zoom)
+        px, py = self.from_view(i, x, y)
+        w, h = self.sizes[i]
+        return (i, min(max(px, 0), w), min(max(py, 0), h))
 
     def selection_range(self):
         if self.sel_anchor is None or self.sel_end is None:
@@ -692,7 +1082,7 @@ class Reader(Gtk.Window):
         if not self.pages:
             return False
         if ev.button == 3:
-            self.popup_menu(ev)
+            self.build_menu(True).popup_at_pointer(ev)
             return True
         if ev.button != 1:
             return False
@@ -769,25 +1159,58 @@ class Reader(Gtk.Window):
                 self.set_zoom(self.zoom * ZOOM_STEP ** (-dy))
         return True
 
-    def popup_menu(self, ev):
+    def build_menu(self, context):
+        """The header-bar menu; the right-click menu (context=True) adds Copy/Select All."""
+        has_doc = bool(self.pages)
+        items = []
+        if context:
+            items += [("Copy", self.copy, bool(self.selected_text()), Gdk.KEY_c, CTRL),
+                      ("Select All", self.select_all, has_doc, Gdk.KEY_a, CTRL), None]
+        sidebar_on = self.sidebar_toggle.get_active()
+        items += [
+            ("Hide Outline" if sidebar_on else "Show Outline", self.toggle_sidebar, self.has_outline,
+             Gdk.KEY_F9, 0),
+            ("Rotate Left", lambda: self.rotate(-90), has_doc, Gdk.KEY_Left, CTRL),
+            ("Rotate Right", lambda: self.rotate(90), has_doc, Gdk.KEY_Right, CTRL),
+            None,
+            ("Leave Fullscreen" if self.is_fullscreen else "Fullscreen", self.toggle_fullscreen, True,
+             Gdk.KEY_F11, 0),
+            ("Presentation", self.enter_presentation, has_doc, Gdk.KEY_F5, 0),
+            None,
+            ("Print…", self.print_doc, has_doc, Gdk.KEY_p, CTRL),
+        ]
         menu = Gtk.Menu()
-        has_sel = bool(self.selected_text())
-        for label, callback, sensitive in (("Copy", self.copy, has_sel),
-                                           ("Select All", self.select_all, True),
-                                           ("Print…", self.print_doc, True)):
+        for entry in items:
+            if entry is None:
+                menu.append(Gtk.SeparatorMenuItem())
+                continue
+            label, callback, sensitive, keyval, mods = entry
             item = Gtk.MenuItem(label=label)
+            item.get_child().set_accel(keyval, mods)
             item.set_sensitive(sensitive)
             item.connect("activate", lambda _, cb=callback: cb())
             menu.append(item)
         menu.show_all()
         menu.attach_to_widget(self.canvas)
-        menu.popup_at_pointer(ev)
         self._menu = menu  # keep a reference while shown
+        return menu
 
     # ------------------------------------------------------------ keyboard
     def on_key(self, widget, ev):
         key = Gdk.keyval_to_lower(ev.keyval)
-        entry_focused = isinstance(self.get_focus(), Gtk.Entry)
+        if self.presenting:
+            return self.on_pres_key(key, ev)
+        focus = self.get_focus()
+        entry_focused = isinstance(focus, Gtk.Entry)
+        if key == Gdk.KEY_F5:
+            self.enter_presentation()
+            return True
+        if key == Gdk.KEY_F11:
+            self.toggle_fullscreen()
+            return True
+        if key == Gdk.KEY_F9:
+            self.toggle_sidebar()
+            return True
         if key == Gdk.KEY_F3:
             self.next_match(-1 if ev.state & SHIFT else 1)
             return True
@@ -811,6 +1234,8 @@ class Reader(Gtk.Window):
                 actions[Gdk.KEY_c] = self.copy
                 actions[Gdk.KEY_Insert] = self.copy
                 actions[Gdk.KEY_a] = self.select_all
+                actions[Gdk.KEY_Left] = lambda: self.rotate(-90)
+                actions[Gdk.KEY_Right] = lambda: self.rotate(90)
             if key in actions:
                 actions[key]()
                 return True
@@ -821,11 +1246,18 @@ class Reader(Gtk.Window):
                 self.vadj.set_value(self.vadj.get_upper())
                 return True
             return False
-        if entry_focused or not self.pages:
+        # Let text entries and the outline tree handle their own navigation keys.
+        if entry_focused or isinstance(focus, Gtk.TreeView) or not self.pages:
+            if key == Gdk.KEY_Escape and self.is_fullscreen and not entry_focused:
+                self.unfullscreen()
+                return True
             return False
         if key == Gdk.KEY_Escape:
             if self.search_bar.get_search_mode():
                 self.search_bar.set_search_mode(False)
+                return True
+            if self.is_fullscreen:
+                self.unfullscreen()
                 return True
             self.sel_anchor = self.sel_end = None
             self.canvas.queue_draw()
@@ -890,7 +1322,11 @@ def main():
     win = Reader(sys.argv[1] if len(sys.argv) > 1 else None)
     win.connect("destroy", Gtk.main_quit)
     win.show_all()
-    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, Gtk.main_quit)
+
+    def on_sigint():  # Ctrl+C in the terminal: close normally so the position is saved
+        win.close()
+        return False
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, on_sigint)
     Gtk.main()
 
 
