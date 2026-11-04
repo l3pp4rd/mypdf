@@ -7,7 +7,9 @@ import bisect
 import os
 import signal
 import sys
+import time
 from collections import OrderedDict
+from urllib.parse import urlparse
 
 import gi
 
@@ -19,7 +21,7 @@ except ValueError:
     sys.exit("Poppler bindings are missing. Install them with:\n"
              "  sudo apt install gir1.2-poppler-0.18")
 import cairo
-from gi.repository import Gdk, Gio, GLib, Gtk, Poppler
+from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Poppler
 
 MARGIN = 16                  # px around and between pages
 ZOOM_MIN, ZOOM_MAX = 0.2, 6.0
@@ -29,9 +31,13 @@ CACHE_PIXELS = 16_000_000    # rendered-page cache budget (~64 MB)
 BACKGROUND = (0.40, 0.40, 0.42)
 SEL_GLYPH = (0xFFFF, 0xFFFF, 0xFFFF)
 SEL_BG = (0x3584, 0x8484, 0xE4E4)
+MATCH_COLOR = (1.0, 0.85, 0.0, 0.40)
+CURRENT_MATCH_COLOR = (1.0, 0.45, 0.0, 0.55)
+SAFE_URI_SCHEMES = {"http", "https", "mailto", "ftp"}
 
 CTRL = Gdk.ModifierType.CONTROL_MASK
 SHIFT = Gdk.ModifierType.SHIFT_MASK
+ALT = Gdk.ModifierType.MOD1_MASK
 
 
 def poppler_color(rgb):
@@ -66,6 +72,21 @@ class Reader(Gtk.Window):
         self.autoscroll_id = 0
         self.glyph_color = poppler_color(SEL_GLYPH)
         self.bg_color = poppler_color(SEL_BG)
+
+        # Search: matches are (page, (x1, y1, x2, y2)) in top-left PDF points.
+        self.matches = []
+        self.match_pages = {}    # page -> list of rects, for drawing
+        self.match_index = -1
+        self.search_id = 0
+        self.search_text = ""
+        self.search_page = 0
+        self.search_start = 0
+
+        # Links
+        self.link_cache = {}     # page -> list of (x1, y1, x2, y2, Poppler.LinkMapping)
+        self.hover_link = None
+        self.pressed_link = None
+        self.history = []        # previous scroll positions, for Alt+Left
 
         self._build_ui()
         if path:
@@ -107,6 +128,35 @@ class Reader(Gtk.Window):
         zoom.pack_start(self._button("zoom-in-symbolic", "Zoom in (Ctrl++)", self.zoom_in), False, False, 0)
         hb.pack_end(zoom)
 
+        self.search_toggle = Gtk.ToggleButton(image=Gtk.Image.new_from_icon_name(
+            "edit-find-symbolic", Gtk.IconSize.BUTTON), tooltip_text="Find (Ctrl+F)")
+        hb.pack_end(self.search_toggle)
+
+        self.search_entry = Gtk.SearchEntry(width_chars=30)
+        self.search_entry.connect("search-changed", lambda *_: self.start_search())
+        self.search_entry.connect("activate", lambda *_: self.next_match(1))
+        self.search_entry.connect("next-match", lambda *_: self.next_match(1))
+        self.search_entry.connect("previous-match", lambda *_: self.next_match(-1))
+        self.search_entry.connect("key-press-event", self.on_search_key)
+        self.search_label = Gtk.Label()
+        self.search_label.get_style_context().add_class("dim-label")
+        search_box = Gtk.Box(spacing=6)
+        search_box.pack_start(self.search_entry, False, False, 0)
+        nav_box = Gtk.Box()
+        nav_box.get_style_context().add_class("linked")
+        nav_box.pack_start(self._button("go-up-symbolic", "Previous match (Shift+Enter)",
+                                        lambda: self.next_match(-1)), False, False, 0)
+        nav_box.pack_start(self._button("go-down-symbolic", "Next match (Enter)",
+                                        lambda: self.next_match(1)), False, False, 0)
+        search_box.pack_start(nav_box, False, False, 0)
+        search_box.pack_start(self.search_label, False, False, 6)
+        self.search_bar = Gtk.SearchBar(show_close_button=True)
+        self.search_bar.add(search_box)
+        self.search_bar.connect_entry(self.search_entry)
+        self.search_bar.bind_property("search-mode-enabled", self.search_toggle, "active",
+                                      GObject.BindingFlags.BIDIRECTIONAL)
+        self.search_bar.connect("notify::search-mode-enabled", self.on_search_mode)
+
         self.canvas = Gtk.Layout()
         self.canvas.set_can_focus(True)
         self.canvas.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
@@ -123,7 +173,10 @@ class Reader(Gtk.Window):
 
         sw = Gtk.ScrolledWindow()
         sw.add(self.canvas)
-        self.add(sw)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        vbox.pack_start(self.search_bar, False, False, 0)
+        vbox.pack_start(sw, True, True, 0)
+        self.add(vbox)
         self.hadj = sw.get_hadjustment()
         self.vadj = sw.get_vadjustment()
         self.vadj.connect("value-changed", lambda *_: self.update_current_page())
@@ -136,8 +189,8 @@ class Reader(Gtk.Window):
         self.update_sensitivity()
 
     def update_sensitivity(self):
-        self.print_button.set_sensitive(self.doc is not None)
-        self.page_entry.set_sensitive(self.doc is not None)
+        for w in (self.print_button, self.page_entry, self.search_toggle):
+            w.set_sensitive(self.doc is not None)
 
     def error(self, text):
         d = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.ERROR,
@@ -182,6 +235,9 @@ class Reader(Gtk.Window):
         self.pages = [doc.get_page(i) for i in range(doc.get_n_pages())]
         self.sizes = [p.get_size() for p in self.pages]
         self.cache.clear()
+        self.link_cache.clear()
+        self.history.clear()
+        self.hover_link = self.pressed_link = None
         self.sel_anchor = self.sel_end = None
         self.fit_mode = "auto"
         self.current = 0
@@ -194,6 +250,7 @@ class Reader(Gtk.Window):
         self.vadj.set_value(0)
         self.hadj.set_value(0)
         self.canvas.grab_focus()
+        self.start_search()  # re-run (or clear) the search for the new document
         return False
 
     def open_dialog(self):
@@ -283,9 +340,19 @@ class Reader(Gtk.Window):
         if not self.page_entry.has_focus():
             self.page_entry.set_text(str(self.current + 1) if self.pages else "")
 
-    def go_to_page(self, i):
+    def go_to_page(self, i, y=0.0):
+        """Scroll so that point y (PDF points from the page top) of page i is at the top."""
         i = min(max(i, 0), len(self.pages) - 1)
-        self.vadj.set_value(self.rects[i][1] - MARGIN // 2)
+        self.push_history()
+        self.vadj.set_value(self.rects[i][1] + y * self.zoom - MARGIN // 2)
+
+    def push_history(self):
+        self.history.append(self.vadj.get_value())
+        del self.history[:-50]
+
+    def go_back(self):
+        if self.history:
+            self.vadj.set_value(self.history.pop())
 
     def on_page_entry(self, entry):
         try:
@@ -348,8 +415,219 @@ class Reader(Gtk.Window):
                     self.pages[i].render_selection(cr, sel, Poppler.Rectangle(), self.sel_style,
                                                    self.glyph_color, self.bg_color)
                     cr.restore()
+                self.draw_matches(cr, i)
         cr.restore()
         return False
+
+    def draw_matches(self, cr, i):
+        rects = self.match_pages.get(i)
+        if not rects:
+            return
+        px, py, _, _ = self.rects[i]
+        z = self.zoom
+        current = self.matches[self.match_index] if self.match_index >= 0 else None
+        for r in rects:
+            cr.set_source_rgba(*(CURRENT_MATCH_COLOR if current == (i, r) else MATCH_COLOR))
+            cr.rectangle(px + r[0] * z - 1, py + r[1] * z - 1, (r[2] - r[0]) * z + 2, (r[3] - r[1]) * z + 2)
+            cr.fill()
+
+    # -------------------------------------------------------------- search
+    def show_search(self):
+        if not self.pages:
+            return
+        text = self.selected_text().strip()
+        if text and "\n" not in text and len(text) < 100:
+            self.search_entry.set_text(text)
+        self.search_bar.set_search_mode(True)
+        self.search_entry.grab_focus()
+
+    def on_search_mode(self, bar, _pspec):
+        if bar.get_search_mode():
+            self.start_search()
+            return
+        self.cancel_search()
+        self.matches, self.match_pages, self.match_index = [], {}, -1
+        self.canvas.queue_draw()
+        self.canvas.grab_focus()
+
+    def on_search_key(self, entry, ev):
+        if ev.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and ev.state & SHIFT:
+            self.next_match(-1)
+            return True
+        return False
+
+    def cancel_search(self):
+        if self.search_id:
+            GLib.source_remove(self.search_id)
+            self.search_id = 0
+
+    def start_search(self):
+        """(Re)start an incremental search; pages are scanned in idle time."""
+        self.cancel_search()
+        self.matches, self.match_pages, self.match_index = [], {}, -1
+        self.search_text = self.search_entry.get_text() if self.search_bar.get_search_mode() else ""
+        if self.search_text and self.pages:
+            self.search_page = 0
+            self.search_start = self.current
+            self.search_id = GLib.idle_add(self.search_step)
+        self.update_search_label()
+        self.canvas.queue_draw()
+
+    def search_step(self):
+        deadline = time.monotonic() + 0.03
+        n = len(self.pages)
+        while self.search_page < n and time.monotonic() < deadline:
+            i = self.search_page
+            self.search_page += 1
+            found = self.pages[i].find_text_with_options(self.search_text, Poppler.FindFlags.DEFAULT)
+            if not found:
+                continue
+            h = self.sizes[i][1]
+            rects = [(r.x1, h - r.y2, r.x2, h - r.y1) for r in found]
+            self.match_pages[i] = rects
+            first = len(self.matches)
+            self.matches.extend((i, r) for r in rects)
+            if self.match_index < 0 and i >= self.search_start:
+                self.match_index = first
+                self.show_match()
+        done = self.search_page >= n
+        if done:
+            self.search_id = 0
+            if self.match_index < 0 and self.matches:
+                self.match_index = 0
+                self.show_match()
+        self.update_search_label()
+        self.canvas.queue_draw()
+        return not done
+
+    def update_search_label(self):
+        searching = bool(self.search_id)
+        if self.matches:
+            text = f"{self.match_index + 1} of {len(self.matches)}" if self.match_index >= 0 \
+                else f"{len(self.matches)} found"
+            text += "…" if searching else ""
+        elif searching:
+            text = "Searching…"
+        else:
+            text = "No matches" if self.search_text else ""
+        self.search_label.set_text(text)
+
+    def next_match(self, step):
+        if not self.matches:
+            return
+        if self.match_index < 0:
+            self.match_index = 0
+        else:
+            self.match_index = (self.match_index + step) % len(self.matches)
+        self.show_match()
+        self.update_search_label()
+
+    def show_match(self):
+        """Scroll the current match into view and redraw."""
+        i, (x1, y1, x2, y2) = self.matches[self.match_index]
+        px, py, _, _ = self.rects[i]
+        z = self.zoom
+        top, bottom = py + y1 * z, py + y2 * z
+        v = self.vadj
+        if top < v.get_value() or bottom > v.get_value() + v.get_page_size():
+            v.set_value(top - v.get_page_size() / 3)
+        left, right = px + x1 * z, px + x2 * z
+        hz = self.hadj
+        if left < hz.get_value() or right > hz.get_value() + hz.get_page_size():
+            hz.set_value(left - hz.get_page_size() / 3)
+        self.canvas.queue_draw()
+
+    # --------------------------------------------------------------- links
+    def page_links(self, i):
+        if i not in self.link_cache:
+            h = self.sizes[i][1]
+            self.link_cache[i] = [(m.area.x1, h - m.area.y2, m.area.x2, h - m.area.y1, m)
+                                  for m in self.pages[i].get_link_mapping()]
+        return self.link_cache[i]
+
+    def link_at(self, x, y):
+        if not self.rects:
+            return None
+        i = self.page_at(y)
+        px, py, pw, ph = self.rects[i]
+        if not (px <= x <= px + pw and py <= y <= py + ph):
+            return None
+        lx, ly = (x - px) / self.zoom, (y - py) / self.zoom
+        for x1, y1, x2, y2, mapping in self.page_links(i):
+            if x1 <= lx <= x2 and y1 <= ly <= y2:
+                return mapping.action
+        return None
+
+    def resolve_dest(self, dest):
+        if dest and dest.type == Poppler.DestType.NAMED:
+            dest = self.doc.find_dest(dest.named_dest)
+        return dest
+
+    def describe_link(self, action):
+        t = action.type
+        if t == Poppler.ActionType.URI:
+            return action.uri.uri
+        if t == Poppler.ActionType.GOTO_DEST:
+            dest = self.resolve_dest(action.goto_dest.dest)
+            return f"Go to page {dest.page_num}" if dest else None
+        if t == Poppler.ActionType.GOTO_REMOTE:
+            return f"Open {action.goto_remote.file_name}"
+        if t == Poppler.ActionType.NAMED:
+            return action.named.named_dest
+        return None
+
+    def set_hover_link(self, action):
+        if action is self.hover_link or (action is None and self.hover_link is None):
+            return
+        self.hover_link = action
+        window = self.canvas.get_bin_window()
+        window.set_cursor(Gdk.Cursor.new_from_name(window.get_display(), "pointer" if action else "text"))
+        self.canvas.set_tooltip_text(self.describe_link(action) if action else None)
+
+    def activate_link(self, action):
+        t = action.type
+        if t == Poppler.ActionType.URI:
+            self.open_uri(action.uri.uri)
+        elif t == Poppler.ActionType.GOTO_DEST:
+            self.go_to_dest(action.goto_dest.dest)
+        elif t == Poppler.ActionType.GOTO_REMOTE:
+            name = action.goto_remote.file_name
+            path = name if os.path.isabs(name) else os.path.join(os.path.dirname(self.path or ""), name)
+            if os.path.isfile(path):
+                dest = action.goto_remote.dest
+                self.load(path)
+                self.go_to_dest(dest)
+            else:
+                self.error(f"Linked file not found:\n{path}")
+        elif t == Poppler.ActionType.NAMED:
+            name = action.named.named_dest
+            target = {"NextPage": self.current + 1, "PrevPage": self.current - 1,
+                      "FirstPage": 0, "LastPage": len(self.pages) - 1}.get(name)
+            if target is not None:
+                self.go_to_page(target)
+        # Other action types (launching programs, JavaScript, media) are deliberately ignored.
+
+    def go_to_dest(self, dest):
+        dest = self.resolve_dest(dest)
+        if not dest or not 1 <= dest.page_num <= len(self.pages):
+            return
+        i = dest.page_num - 1
+        y = 0.0
+        if dest.type in (Poppler.DestType.XYZ, Poppler.DestType.FITH, Poppler.DestType.FITBH) and dest.top > 0:
+            y = max(0.0, self.sizes[i][1] - dest.top)
+        self.go_to_page(i, y)
+
+    def open_uri(self, uri):
+        if urlparse(uri).scheme.lower() not in SAFE_URI_SCHEMES:
+            if uri.startswith("www."):
+                uri = "https://" + uri
+            else:
+                self.error(f"Not opening link with unsupported address:\n{uri}")
+                return
+        try:
+            Gtk.show_uri_on_window(self, uri, Gdk.CURRENT_TIME)
+        except GLib.Error as e:
+            self.error(f"Cannot open link:\n{e.message}")
 
     # ----------------------------------------------------------- selection
     def hit(self, x, y):
@@ -419,6 +697,11 @@ class Reader(Gtk.Window):
         if ev.button != 1:
             return False
         point = self.hit(ev.x, ev.y)
+        self.pressed_link = None
+        if ev.type == Gdk.EventType.BUTTON_PRESS and not ev.state & SHIFT:
+            link = self.link_at(ev.x, ev.y)
+            if link:
+                self.pressed_link = (link, ev.x, ev.y)
         if ev.type == Gdk.EventType.DOUBLE_BUTTON_PRESS:
             self.sel_style = Poppler.SelectionStyle.WORD
         elif ev.type == Gdk.EventType.TRIPLE_BUTTON_PRESS:
@@ -438,6 +721,8 @@ class Reader(Gtk.Window):
         if self.dragging:
             self.sel_end = self.hit(ev.x, ev.y)
             self.canvas.queue_draw()
+        elif self.pages:
+            self.set_hover_link(self.link_at(ev.x, ev.y))
         return False
 
     def on_release(self, widget, ev):
@@ -446,6 +731,13 @@ class Reader(Gtk.Window):
             if self.autoscroll_id:
                 GLib.source_remove(self.autoscroll_id)
                 self.autoscroll_id = 0
+            pressed, self.pressed_link = self.pressed_link, None
+            # A click (not a drag) on a link follows it.
+            if pressed and abs(ev.x - pressed[1]) < 4 and abs(ev.y - pressed[2]) < 4:
+                self.sel_anchor = self.sel_end = None
+                self.canvas.queue_draw()
+                self.activate_link(pressed[0])
+                return True
             self.set_primary()
         return False
 
@@ -495,9 +787,17 @@ class Reader(Gtk.Window):
     # ------------------------------------------------------------ keyboard
     def on_key(self, widget, ev):
         key = Gdk.keyval_to_lower(ev.keyval)
-        entry_focused = self.page_entry.has_focus()
+        entry_focused = isinstance(self.get_focus(), Gtk.Entry)
+        if key == Gdk.KEY_F3:
+            self.next_match(-1 if ev.state & SHIFT else 1)
+            return True
+        if ev.state & ALT and key == Gdk.KEY_Left:
+            self.go_back()
+            return True
         if ev.state & CTRL:
             actions = {
+                Gdk.KEY_f: self.show_search,
+                Gdk.KEY_g: lambda: self.next_match(-1 if ev.state & SHIFT else 1),
                 Gdk.KEY_o: self.open_dialog,
                 Gdk.KEY_p: self.print_doc,
                 Gdk.KEY_w: self.close,
@@ -524,6 +824,9 @@ class Reader(Gtk.Window):
         if entry_focused or not self.pages:
             return False
         if key == Gdk.KEY_Escape:
+            if self.search_bar.get_search_mode():
+                self.search_bar.set_search_mode(False)
+                return True
             self.sel_anchor = self.sel_end = None
             self.canvas.queue_draw()
             return True
